@@ -1,0 +1,33 @@
+{
+  "name": "excalidraw-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for the Val4evr/excalidraw-zephy canvas (room-scoped). Slim install for one-line `claude mcp add` use.",
+  "type": "module",
+  "bin": {
+    "excalidraw-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc || true"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "dotenv": "^16.3.1",
+    "node-fetch": "^3.3.2",
+    "winston": "^3.11.0",
+    "zod": "^3.22.4",
+    "zod-to-json-schema": "^3.22.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Val4evr/excalidraw-mcp.git"
+  }
+}
