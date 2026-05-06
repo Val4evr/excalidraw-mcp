@@ -1583,21 +1583,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           throw new Error('No elements found in the import data');
         }
 
-        // If replace mode, clear first
-        if (params.mode === 'replace') {
-          await fetch(`${API_BASE}/elements/clear`, { method: 'DELETE' });
-        }
-
-        // Batch create the imported elements
-        const elementsToCreate = importElements.map(el => ({
+        const elementsToImport: ServerElement[] = importElements.map(el => ({
           ...el,
           id: el.id || generateId(),
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          version: 1
-        }));
+          createdAt: el.createdAt || new Date().toISOString(),
+          updatedAt: el.updatedAt || new Date().toISOString(),
+          version: typeof el.version === 'number' ? el.version : 1
+        } as ServerElement));
 
-        const canvasElements = await batchCreateElementsOnCanvas(elementsToCreate);
+        let elementsToSync: ServerElement[] = elementsToImport;
+        if (params.mode === 'merge') {
+          const existingResponse = await fetch(`${API_BASE}/elements`);
+          if (existingResponse.ok) {
+            const existingData = await existingResponse.json() as ApiResponse;
+            elementsToSync = [...(existingData.elements || []), ...elementsToImport];
+          }
+        }
+
+        const syncResponse = await fetch(`${API_BASE}/elements/sync`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            elements: elementsToSync,
+            timestamp: new Date().toISOString()
+          })
+        });
+
+        if (!syncResponse.ok) {
+          const errorText = await syncResponse.text();
+          throw new Error(`Failed to import scene: ${syncResponse.status} ${syncResponse.statusText} ${errorText}`);
+        }
 
         // Import files if present (for image elements)
         let importedFileCount = 0;
@@ -1619,7 +1634,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         return {
           content: [{
             type: 'text',
-            text: `Imported ${elementsToCreate.length} elements${importedFileCount > 0 ? ` and ${importedFileCount} files` : ''} (mode: ${params.mode})\n\n✅ Synced to canvas`
+            text: `Imported ${elementsToImport.length} elements${importedFileCount > 0 ? ` and ${importedFileCount} files` : ''} (mode: ${params.mode})\n\n✅ Synced full scene data to canvas`
           }]
         };
       }
