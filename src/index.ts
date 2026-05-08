@@ -489,7 +489,7 @@ const DIAGRAM_DESIGN_GUIDE = `# Excalidraw Diagram Design Guide
 const tools: Tool[] = [
   {
     name: 'set_room',
-    description: 'Set the active Excalidraw room for this session. Pass either roomUrl (e.g. https://draw.proklov.dev/r/<id>) or both roomId and expressUrl. Subsequent canvas tools default to this room until changed.',
+    description: 'Set the active Excalidraw room for this session. CALL THIS FIRST whenever the user pastes or references an Excalidraw room URL like https://draw.proklov.dev/r/<id> — pass that URL as `roomUrl`. The shim parses the host and room id from the URL automatically. Subsequent canvas tools default to this room until set_room is called again with a different URL. Alternative: pass roomId + expressUrl separately if the URL is not available.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1084,7 +1084,23 @@ const server = new Server(
         description: tool.description,
         inputSchema: tool.inputSchema
       }]))
-    }
+    },
+    instructions: [
+      "This server drives a self-hosted Excalidraw canvas split into rooms.",
+      "Every canvas tool operates on whichever room is currently active.",
+      "",
+      "Room targeting:",
+      "  • A room URL looks like https://<host>/r/<id>, e.g. https://draw.proklov.dev/r/t5E00jYl5vK1",
+      "  • If the user pastes (or otherwise gives) a room URL during the conversation, call `set_room` with `{ \"roomUrl\": \"<that URL>\" }` before any other canvas tool — that pins the room for the rest of the session.",
+      "  • If no room is set when a canvas tool is called, it errors. Fall back to `set_room` (or pass `roomUrl` as an arg on the tool call) instead of asking the user to re-install.",
+      "  • To switch rooms mid-session, call `set_room` again with the new URL. To check the current room, call `get_room`.",
+      "  • Per-call overrides also work: pass `roomUrl` (full URL) or `roomId` on any individual canvas tool call to target a different room just for that call.",
+      "",
+      "Reading large boards:",
+      "  • Default to `describe_scene` with `detail: \"overview\"` — it returns a bounded summary plus a section index even for huge canvases. Use `sectionIndex`, `types`, `textIncludes`, `offset`, `limit` to drill in. Reach for `detail: \"full\"` only when you genuinely need the complete dump.",
+      "  • `get_canvas_screenshot` defaults to a 1600px-longest-edge cap so big scenes render in seconds. Override with `maxDim`, `scale`, `bbox`, or `timeoutMs` if you need pixel-perfect output or only a slice.",
+      "  • Screenshots require at least one browser tab open in the room — the export pipeline is client-driven."
+    ].join("\n")
   }
 );
 
