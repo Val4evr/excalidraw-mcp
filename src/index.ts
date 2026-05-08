@@ -93,10 +93,30 @@ function parseRoomUrl(input: string): { expressUrl: string; roomId: string } {
 
 let currentRoom: RoomContext | null = null;
 {
+  // Three accepted env-var forms, in order of preference:
+  //   1. ROOM_URL=https://draw.proklov.dev/r/<id>   (single pasted share link)
+  //   2. ROOM_ID + EXPRESS_SERVER_URL                (legacy dashboard form)
+  //   3. ROOM_ID alone                               (assumes localhost canvas)
+  // None of these are required at boot — if all are absent, the shim starts
+  // empty and the caller can use the `set_room` tool or pass `roomUrl` per call.
+  const envUrl = process.env.ROOM_URL;
   const envExpress = process.env.EXPRESS_SERVER_URL?.replace(/\/$/, '');
   const envRoom = process.env.ROOM_ID;
-  if (envExpress && envRoom) currentRoom = makeRoomContext(envExpress, envRoom);
-  else if (envRoom) currentRoom = makeRoomContext('http://127.0.0.1:3000', envRoom);
+  if (envUrl) {
+    try {
+      const parsed = parseRoomUrl(envUrl);
+      currentRoom = makeRoomContext(envExpress ?? parsed.expressUrl, parsed.roomId);
+    } catch (err) {
+      // Don't abort startup on a malformed URL — surface a clear warning and
+      // let the caller fix it via set_room or a fresh install.
+      // eslint-disable-next-line no-console
+      console.error(`[excalidraw-mcp] Ignoring invalid ROOM_URL=${envUrl}: ${(err as Error).message}`);
+    }
+  } else if (envExpress && envRoom) {
+    currentRoom = makeRoomContext(envExpress, envRoom);
+  } else if (envRoom) {
+    currentRoom = makeRoomContext('http://127.0.0.1:3000', envRoom);
+  }
 }
 
 interface RoomOverride {
