@@ -27,3 +27,23 @@ ROOM_ID=test EXPRESS_SERVER_URL=http://localhost:3000 node dist/index.js
 
 The shim speaks MCP over stdio; it makes HTTP calls to the canvas at
 `${EXPRESS_SERVER_URL}/api/r/${ROOM_ID}/...`.
+
+## Reading large boards
+
+`describe_scene` is intentionally bounded by default. A large canvas returns a
+summary, a spatial section index, and prominent text instead of dumping every
+element into the model context.
+
+Useful calls:
+
+```json
+{ "detail": "overview" }
+{ "detail": "elements", "sectionIndex": 2, "limit": 60 }
+{ "detail": "elements", "types": ["text"], "textIncludes": "SESSION" }
+{ "detail": "connections", "sectionIndex": 4 }
+{ "detail": "full" }
+```
+
+Use `detail: "full"` only when you truly need the legacy complete dump. For
+most canvas-reading workflows, start with the overview and page into sections
+with `sectionIndex`, `offset`, and `limit`.

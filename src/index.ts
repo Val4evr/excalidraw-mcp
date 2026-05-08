@@ -28,6 +28,11 @@ import {
   validateElement,
   normalizeFontFamily
 } from './types.js';
+import {
+  buildSceneDescription,
+  SCENE_DESCRIPTION_DETAILS,
+  type SceneDescriptionDetail,
+} from './sceneDescription.js';
 import fetch from 'node-fetch';
 
 // Load environment variables
@@ -48,21 +53,88 @@ function sanitizeFilePath(filePath: string): string {
   return resolved;
 }
 
-// Express server configuration
-const EXPRESS_SERVER_URL = (process.env.EXPRESS_SERVER_URL || 'http://127.0.0.1:3000').replace(/\/$/, '');
-const ROOM_ID = process.env.ROOM_ID || '';
-if (!ROOM_ID) {
-  // eslint-disable-next-line no-console
-  console.error(
-    'ROOM_ID env var is required.\n' +
-    'Open the dashboard, create a board, and copy the install command — it sets ROOM_ID for you.\n' +
-    'Or set it manually:  ROOM_ID=<board-id> EXPRESS_SERVER_URL=<canvas-url>'
-  );
-  process.exit(1);
+// Express server / room configuration.
+// The shim is no longer pinned to a single room at startup. Tools may carry
+// their own `roomUrl`/`roomId` per call, or callers can use `set_room` to set
+// a session-wide active room. ENV vars are still honored as a default if both
+// are present, so existing pinned installs keep working unchanged.
+const ENABLE_CANVAS_SYNC = process.env.ENABLE_CANVAS_SYNC !== 'false';
+
+interface RoomContext {
+  expressUrl: string;   // e.g. https://draw.proklov.dev (no trailing slash)
+  roomId: string;
+  apiBase: string;      // ${expressUrl}/api/r/${roomId}
+  roomViewUrl: string;  // ${expressUrl}/r/${roomId}
 }
-const API_BASE = `${EXPRESS_SERVER_URL}/api/r/${ROOM_ID}`;
-const ROOM_URL = `${EXPRESS_SERVER_URL}/r/${ROOM_ID}`;
-const ENABLE_CANVAS_SYNC = process.env.ENABLE_CANVAS_SYNC !== 'false'; // Default to true
+
+function makeRoomContext(expressUrl: string, roomId: string): RoomContext {
+  const cleanExpress = expressUrl.replace(/\/$/, '');
+  if (!cleanExpress) throw new Error('expressUrl is required');
+  if (!roomId) throw new Error('roomId is required');
+  return {
+    expressUrl: cleanExpress,
+    roomId,
+    apiBase: `${cleanExpress}/api/r/${roomId}`,
+    roomViewUrl: `${cleanExpress}/r/${roomId}`,
+  };
+}
+
+function parseRoomUrl(input: string): { expressUrl: string; roomId: string } {
+  let url: URL;
+  try { url = new URL(input); }
+  catch { throw new Error(`Invalid roomUrl: ${input}`); }
+  const parts = url.pathname.split('/').filter(Boolean);
+  let roomId: string | undefined;
+  if (parts[0] === 'r' && parts[1]) roomId = parts[1];
+  else if (parts.length === 1) roomId = parts[0];
+  if (!roomId) throw new Error(`Could not extract room id from ${input}`);
+  return { expressUrl: `${url.protocol}//${url.host}`, roomId };
+}
+
+let currentRoom: RoomContext | null = null;
+{
+  const envExpress = process.env.EXPRESS_SERVER_URL?.replace(/\/$/, '');
+  const envRoom = process.env.ROOM_ID;
+  if (envExpress && envRoom) currentRoom = makeRoomContext(envExpress, envRoom);
+  else if (envRoom) currentRoom = makeRoomContext('http://127.0.0.1:3000', envRoom);
+}
+
+interface RoomOverride {
+  roomUrl?: string;
+  roomId?: string;
+  expressUrl?: string;
+}
+
+function extractRoomArgs(args: any): RoomOverride {
+  if (!args || typeof args !== 'object') return {};
+  const { roomUrl, roomId, expressUrl } = args as RoomOverride;
+  return { roomUrl, roomId, expressUrl };
+}
+
+function resolveRoom(opts?: RoomOverride): RoomContext {
+  if (opts?.roomUrl) {
+    const parsed = parseRoomUrl(opts.roomUrl);
+    return makeRoomContext(opts.expressUrl ?? parsed.expressUrl, parsed.roomId);
+  }
+  if (opts?.roomId) {
+    const expressUrl =
+      opts.expressUrl ??
+      currentRoom?.expressUrl ??
+      process.env.EXPRESS_SERVER_URL?.replace(/\/$/, '');
+    if (!expressUrl) {
+      throw new Error(
+        'Cannot resolve room: roomId was provided but no expressUrl is known. ' +
+        'Pass expressUrl, or use set_room first, or pass a full roomUrl instead.'
+      );
+    }
+    return makeRoomContext(expressUrl, opts.roomId);
+  }
+  if (currentRoom) return currentRoom;
+  throw new Error(
+    'No room is set. Use the set_room tool with a roomUrl ' +
+    '(e.g. https://draw.proklov.dev/r/<id>), or pass roomUrl/roomId on this tool call.'
+  );
+}
 
 // API Response types
 interface ApiResponse {
@@ -80,7 +152,7 @@ interface SyncResponse {
 }
 
 // Helper functions to sync with Express server (canvas)
-async function syncToCanvas(operation: string, data: any): Promise<SyncResponse | null> {
+async function syncToCanvas(room: RoomContext, operation: string, data: any): Promise<SyncResponse | null> {
   if (!ENABLE_CANVAS_SYNC) {
     logger.debug('Canvas sync disabled, skipping');
     return null;
@@ -89,40 +161,40 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
   try {
     let url: string;
     let options: any;
-    
+
     switch (operation) {
       case 'create':
-        url = `${API_BASE}/elements`;
+        url = `${room.apiBase}/elements`;
         options = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(data)
         };
         break;
-        
+
       case 'update':
-        url = `${API_BASE}/elements/${data.id}`;
+        url = `${room.apiBase}/elements/${data.id}`;
         options = {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(data)
         };
         break;
-        
+
       case 'delete':
-        url = `${API_BASE}/elements/${data.id}`;
+        url = `${room.apiBase}/elements/${data.id}`;
         options = { method: 'DELETE' };
         break;
-        
+
       case 'batch_create':
-        url = `${API_BASE}/elements/batch`;
+        url = `${room.apiBase}/elements/batch`;
         options = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ elements: data })
         };
         break;
-        
+
       default:
         logger.warn(`Unknown sync operation: ${operation}`);
         return null;
@@ -141,7 +213,7 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
 
     logger.debug(`Canvas sync successful: ${operation}`, result);
     return result as SyncResponse;
-    
+
   } catch (error) {
     logger.warn(`Canvas sync failed for ${operation}:`, (error as Error).message);
     // Don't throw - we want MCP operations to work even if canvas is unavailable
@@ -149,39 +221,34 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
   }
 }
 
-// Helper to sync element creation to canvas
-async function createElementOnCanvas(elementData: ServerElement): Promise<ServerElement | null> {
-  const result = await syncToCanvas('create', elementData);
+async function createElementOnCanvas(room: RoomContext, elementData: ServerElement): Promise<ServerElement | null> {
+  const result = await syncToCanvas(room, 'create', elementData);
   return result?.element || elementData;
 }
 
-// Helper to sync element update to canvas  
-async function updateElementOnCanvas(elementData: Partial<ServerElement> & { id: string }): Promise<ServerElement | null> {
-  const result = await syncToCanvas('update', elementData);
+async function updateElementOnCanvas(room: RoomContext, elementData: Partial<ServerElement> & { id: string }): Promise<ServerElement | null> {
+  const result = await syncToCanvas(room, 'update', elementData);
   return result?.element || null;
 }
 
-// Helper to sync element deletion to canvas
-async function deleteElementOnCanvas(elementId: string): Promise<any> {
-  const result = await syncToCanvas('delete', { id: elementId });
+async function deleteElementOnCanvas(room: RoomContext, elementId: string): Promise<any> {
+  const result = await syncToCanvas(room, 'delete', { id: elementId });
   return result;
 }
 
-// Helper to sync batch creation to canvas
-async function batchCreateElementsOnCanvas(elementsData: ServerElement[]): Promise<ServerElement[] | null> {
-  const result = await syncToCanvas('batch_create', elementsData);
+async function batchCreateElementsOnCanvas(room: RoomContext, elementsData: ServerElement[]): Promise<ServerElement[] | null> {
+  const result = await syncToCanvas(room, 'batch_create', elementsData);
   return result?.elements || elementsData;
 }
 
-// Helper to fetch element from canvas
-async function getElementFromCanvas(elementId: string): Promise<ServerElement | null> {
+async function getElementFromCanvas(room: RoomContext, elementId: string): Promise<ServerElement | null> {
   if (!ENABLE_CANVAS_SYNC) {
     logger.debug('Canvas sync disabled, skipping fetch');
     return null;
   }
 
   try {
-    const response = await fetch(`${API_BASE}/elements/${elementId}`);
+    const response = await fetch(`${room.apiBase}/elements/${elementId}`);
     if (!response.ok) {
       logger.warn(`Failed to fetch element ${elementId}: ${response.status}`);
       return null;
@@ -288,6 +355,23 @@ const ResourceSchema = z.object({
   resource: z.enum(['scene', 'library', 'theme', 'elements'])
 });
 
+const DescribeSceneSchema = z.object({
+  detail: z.enum(SCENE_DESCRIPTION_DETAILS as unknown as [SceneDescriptionDetail, ...SceneDescriptionDetail[]]).optional(),
+  limit: z.number().int().positive().optional(),
+  offset: z.number().int().nonnegative().optional(),
+  sectionIndex: z.number().int().nonnegative().optional(),
+  sectionLimit: z.number().int().positive().optional(),
+  maxTextLength: z.number().int().positive().optional(),
+  types: z.array(z.enum(Object.values(EXCALIDRAW_ELEMENT_TYPES) as [ExcalidrawElementType, ...ExcalidrawElementType[]])).optional(),
+  textIncludes: z.string().optional(),
+  bbox: z.object({
+    x_min: z.number().optional(),
+    x_max: z.number().optional(),
+    y_min: z.number().optional(),
+    y_max: z.number().optional()
+  }).optional()
+});
+
 // Diagram design guide — injected into LLM context via read_diagram_guide tool
 const DIAGRAM_DESIGN_GUIDE = `# Excalidraw Diagram Design Guide
 
@@ -383,6 +467,26 @@ const DIAGRAM_DESIGN_GUIDE = `# Excalidraw Diagram Design Guide
 
 // Tool definitions
 const tools: Tool[] = [
+  {
+    name: 'set_room',
+    description: 'Set the active Excalidraw room for this session. Pass either roomUrl (e.g. https://draw.proklov.dev/r/<id>) or both roomId and expressUrl. Subsequent canvas tools default to this room until changed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        roomUrl: { type: 'string', description: 'Full room URL — e.g. https://draw.proklov.dev/r/<id>. The expressUrl is parsed from the host.' },
+        roomId: { type: 'string', description: 'Room id alone. Requires expressUrl, or an existing active room/EXPRESS_SERVER_URL env to derive the canvas host.' },
+        expressUrl: { type: 'string', description: 'Override the canvas base URL (e.g. http://zephy:3000). Optional when roomUrl is given.' }
+      }
+    }
+  },
+  {
+    name: 'get_room',
+    description: 'Return the currently active Excalidraw room (expressUrl, roomId, apiBase, roomViewUrl), or null if none is set.',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  },
   {
     name: 'create_element',
     description: 'Create a new Excalidraw element. For arrows, use startElementId/endElementId to bind to shapes (auto-routes to edges).',
@@ -733,7 +837,19 @@ const tools: Tool[] = [
         background: {
           type: 'boolean',
           description: 'Include background in export (default: true)'
-        }
+        },
+        scale: { type: 'number', description: 'exportScale passed to Excalidraw (default 1, range (0,4])' },
+        maxDim: { type: 'number', description: 'Cap longest output edge in pixels (default uncapped). Useful for huge canvases where 1x rasterizes to >50MP and times out.' },
+        bbox: {
+          type: 'object',
+          description: 'Render only elements intersecting this bounding box',
+          properties: {
+            x: { type: 'number' }, y: { type: 'number' },
+            w: { type: 'number' }, h: { type: 'number' }
+          },
+          required: ['x', 'y', 'w', 'h']
+        },
+        timeoutMs: { type: 'number', description: 'Override server-side wall budget (default 30000, max 120000)' }
       },
       required: ['format']
     }
@@ -785,22 +901,82 @@ const tools: Tool[] = [
   },
   {
     name: 'describe_scene',
-    description: 'Get an AI-readable description of the current canvas: element types, positions, connections, labels, spatial layout, and bounding box. Use this to understand what is on the canvas before making changes.',
+    description: 'Get an AI-readable description of the current canvas. Defaults to a bounded overview with spatial sections; use detail="elements" with sectionIndex/offset/limit to page through large boards, or detail="full" for the legacy complete dump.',
     inputSchema: {
       type: 'object',
-      properties: {}
+      properties: {
+        detail: {
+          type: 'string',
+          enum: SCENE_DESCRIPTION_DETAILS,
+          description: 'overview returns summary + section index (default); elements/connections/groups return paginated focused lists; full returns all elements plus connections/groups.'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum items to return for paginated detail modes. Defaults to 80 for elements and all items for full.'
+        },
+        offset: {
+          type: 'number',
+          description: 'Number of matching items to skip before returning paginated results.'
+        },
+        sectionIndex: {
+          type: 'number',
+          description: 'Focus on one spatial section from the overview section index.'
+        },
+        sectionLimit: {
+          type: 'number',
+          description: 'Maximum sections to list in overview mode.'
+        },
+        maxTextLength: {
+          type: 'number',
+          description: 'Maximum characters to show per text/label snippet.'
+        },
+        types: {
+          type: 'array',
+          items: {
+            type: 'string',
+            enum: Object.values(EXCALIDRAW_ELEMENT_TYPES)
+          },
+          description: 'Filter to element types such as text, rectangle, arrow, image.'
+        },
+        textIncludes: {
+          type: 'string',
+          description: 'Filter to elements whose text or label contains this case-insensitive substring.'
+        },
+        bbox: {
+          type: 'object',
+          description: 'Filter to elements intersecting this coordinate box.',
+          properties: {
+            x_min: { type: 'number' },
+            x_max: { type: 'number' },
+            y_min: { type: 'number' },
+            y_max: { type: 'number' }
+          }
+        }
+      }
     }
   },
   {
     name: 'get_canvas_screenshot',
-    description: 'Take a screenshot of the current canvas and return it as an image. Requires the canvas frontend to be open in a browser. Use this to visually verify what the diagram looks like.',
+    description: 'Take a screenshot of the current canvas and return it as an image. Requires the canvas frontend to be open in a browser. Use this to visually verify what the diagram looks like. By default the longest edge is capped at 1600px (maxDim) so huge scenes render quickly; pass maxDim explicitly to override.',
     inputSchema: {
       type: 'object',
       properties: {
         background: {
           type: 'boolean',
           description: 'Include background in screenshot (default: true)'
-        }
+        },
+        scale: { type: 'number', description: 'exportScale passed to Excalidraw (default: implied by maxDim)' },
+        maxDim: { type: 'number', description: 'Cap longest output edge in pixels. Default 1600. Set to 0 to disable.' },
+        bbox: {
+          type: 'object',
+          description: 'Render only elements intersecting this bounding box {x,y,w,h}',
+          properties: {
+            x: { type: 'number' }, y: { type: 'number' },
+            w: { type: 'number' }, h: { type: 'number' }
+          },
+          required: ['x', 'y', 'w', 'h']
+        },
+        timeoutMs: { type: 'number', description: 'Override server-side wall budget in ms (default 30000, max 120000)' }
       }
     }
   },
@@ -851,6 +1027,30 @@ const tools: Tool[] = [
   }
 ];
 
+// Inject optional roomUrl/roomId into every canvas-touching tool so callers
+// can override the active room per request without losing schema discoverability.
+const ROOM_AGNOSTIC_TOOLS = new Set(['set_room', 'get_room', 'read_diagram_guide']);
+const ROOM_OVERRIDE_PROPS = {
+  roomUrl: {
+    type: 'string',
+    description: 'Optional. Override the active room for this call (e.g. https://draw.proklov.dev/r/<id>). Does not persist.'
+  },
+  roomId: {
+    type: 'string',
+    description: 'Optional. Override the active room id for this call. Uses the active room\'s expressUrl as base unless expressUrl is also provided.'
+  },
+  expressUrl: {
+    type: 'string',
+    description: 'Optional. Override the canvas host (paired with roomId) for this call.'
+  }
+} as const;
+for (const tool of tools) {
+  if (ROOM_AGNOSTIC_TOOLS.has(tool.name)) continue;
+  const schema = tool.inputSchema as { properties?: Record<string, unknown> };
+  if (!schema.properties) schema.properties = {};
+  Object.assign(schema.properties, ROOM_OVERRIDE_PROPS);
+}
+
 // Initialize MCP server
 const server = new Server(
   {
@@ -892,7 +1092,55 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
     logger.info(`Handling tool call: ${name}`);
     
     switch (name) {
+      case 'set_room': {
+        const params = z.object({
+          roomUrl: z.string().optional(),
+          roomId: z.string().optional(),
+          expressUrl: z.string().optional()
+        }).parse(args || {});
+
+        if (!params.roomUrl && !params.roomId) {
+          throw new Error('set_room requires roomUrl or roomId.');
+        }
+
+        const room = resolveRoom(params);
+        currentRoom = room;
+        logger.info('Active room set via MCP', { roomId: room.roomId, expressUrl: room.expressUrl });
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Active room set.\n\n${JSON.stringify({
+              expressUrl: room.expressUrl,
+              roomId: room.roomId,
+              apiBase: room.apiBase,
+              roomViewUrl: room.roomViewUrl
+            }, null, 2)}`
+          }]
+        };
+      }
+
+      case 'get_room': {
+        if (!currentRoom) {
+          return {
+            content: [{ type: 'text', text: 'No active room. Use set_room or pass roomUrl/roomId per call.' }]
+          };
+        }
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              expressUrl: currentRoom.expressUrl,
+              roomId: currentRoom.roomId,
+              apiBase: currentRoom.apiBase,
+              roomViewUrl: currentRoom.roomViewUrl
+            }, null, 2)
+          }]
+        };
+      }
+
       case 'create_element': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = ElementSchema.parse(args);
         logger.info('Creating element via MCP', { type: params.type });
 
@@ -924,7 +1172,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const excalidrawElement = convertTextToLabel(element);
 
         // Create element directly on HTTP server (no local storage)
-        const canvasElement = await createElementOnCanvas(excalidrawElement);
+        const canvasElement = await createElementOnCanvas(room, excalidrawElement);
         
         if (!canvasElement) {
           throw new Error('Failed to create element: HTTP server unavailable');
@@ -945,6 +1193,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
       
       case 'update_element': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = ElementIdSchema.merge(ElementSchema.partial()).parse(args);
         const { id, points: rawPoints, ...updates } = params;
 
@@ -967,7 +1216,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const excalidrawElement = convertTextToLabel(updatePayload as ServerElement);
         
         // Update element directly on HTTP server (no local storage)
-        const canvasElement = await updateElementOnCanvas(excalidrawElement);
+        const canvasElement = await updateElementOnCanvas(room, excalidrawElement);
         
         if (!canvasElement) {
           throw new Error('Failed to update element: HTTP server unavailable or element not found');
@@ -987,11 +1236,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
       
       case 'delete_element': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = ElementIdSchema.parse(args);
         const { id } = params;
 
         // Delete element directly on HTTP server (no local storage)
-        const canvasResult = await deleteElementOnCanvas(id);
+        const canvasResult = await deleteElementOnCanvas(room, id);
 
         if (!canvasResult || !(canvasResult as ApiResponse).success) {
           throw new Error('Failed to delete element: HTTP server unavailable or element not found');
@@ -1009,6 +1259,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
       
       case 'query_elements': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = QuerySchema.parse(args || {});
         const { type, filter, bbox } = params;
 
@@ -1029,7 +1280,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           }
           
           // Query elements from HTTP server
-          const url = `${API_BASE}/elements/search?${queryParams}`;
+          const url = `${room.apiBase}/elements/search?${queryParams}`;
           const response = await fetch(url);
           
           if (!response.ok) {
@@ -1064,8 +1315,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           case 'library':
           case 'elements':
             try {
-              // Get elements from HTTP server
-              const response = await fetch(`${API_BASE}/elements`);
+              const room = resolveRoom(extractRoomArgs(args));
+              const response = await fetch(`${room.apiBase}/elements`);
               if (!response.ok) {
                 throw new Error(`HTTP server error: ${response.status} ${response.statusText}`);
               }
@@ -1092,6 +1343,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
       
       case 'group_elements': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = ElementIdsSchema.parse(args);
         const { elementIds } = params;
 
@@ -1102,10 +1354,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           // Update elements on canvas with proper error handling
           // Fetch existing groups and append new groupId to preserve multi-group membership
           const updatePromises = elementIds.map(async (id) => {
-            const element = await getElementFromCanvas(id);
+            const element = await getElementFromCanvas(room, id);
             const existingGroups = element?.groupIds || [];
             const updatedGroupIds = [...existingGroups, groupId];
-            return await updateElementOnCanvas({ id, groupIds: updatedGroupIds });
+            return await updateElementOnCanvas(room, { id, groupIds: updatedGroupIds });
           });
 
           const results = await Promise.all(updatePromises);
@@ -1128,6 +1380,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
       
       case 'ungroup_elements': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = GroupIdSchema.parse(args);
         const { groupId } = params;
 
@@ -1142,7 +1395,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           // Update elements on canvas, removing only this specific groupId
           const updatePromises = (elementIds ?? []).map(async (id) => {
             // Fetch current element to get existing groupIds
-            const element = await getElementFromCanvas(id);
+            const element = await getElementFromCanvas(room, id);
             if (!element) {
               logger.warn(`Element ${id} not found on canvas, skipping ungroup`);
               return null;
@@ -1150,7 +1403,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
             // Remove only the specific groupId, preserve others
             const updatedGroupIds = (element.groupIds || []).filter(gid => gid !== groupId);
-            return await updateElementOnCanvas({ id, groupIds: updatedGroupIds });
+            return await updateElementOnCanvas(room, { id, groupIds: updatedGroupIds });
           });
 
           const results = await Promise.all(updatePromises);
@@ -1172,6 +1425,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
       
       case 'align_elements': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = AlignElementsSchema.parse(args);
         const { elementIds, alignment } = params;
         logger.info('Aligning elements', { elementIds, alignment });
@@ -1179,7 +1433,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         // Fetch all elements
         const elementsToAlign: ServerElement[] = [];
         for (const id of elementIds) {
-          const el = await getElementFromCanvas(id);
+          const el = await getElementFromCanvas(room, id);
           if (el) elementsToAlign.push(el);
         }
 
@@ -1227,7 +1481,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         // Apply updates
         const updatePromises = elementsToAlign.map(async (el) => {
           const coords = updateFn(el);
-          return await updateElementOnCanvas({ id: el.id, ...coords });
+          return await updateElementOnCanvas(room, { id: el.id, ...coords });
         });
         const results = await Promise.all(updatePromises);
         const successCount = results.filter(r => r).length;
@@ -1243,6 +1497,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
       
       case 'distribute_elements': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = DistributeElementsSchema.parse(args);
         const { elementIds, direction } = params;
         logger.info('Distributing elements', { elementIds, direction });
@@ -1250,7 +1505,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         // Fetch all elements
         const elementsToDist: ServerElement[] = [];
         for (const id of elementIds) {
-          const el = await getElementFromCanvas(id);
+          const el = await getElementFromCanvas(room, id);
           if (el) elementsToDist.push(el);
         }
 
@@ -1269,7 +1524,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
           let currentX = first.x;
           for (const el of elementsToDist) {
-            await updateElementOnCanvas({ id: el.id, x: currentX });
+            await updateElementOnCanvas(room, { id: el.id, x: currentX });
             currentX += (el.width || 0) + gap;
           }
         } else {
@@ -1283,7 +1538,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
           let currentY = first.y;
           for (const el of elementsToDist) {
-            await updateElementOnCanvas({ id: el.id, y: currentY });
+            await updateElementOnCanvas(room, { id: el.id, y: currentY });
             currentY += (el.height || 0) + gap;
           }
         }
@@ -1295,13 +1550,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
       
       case 'lock_elements': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = ElementIdsSchema.parse(args);
         const { elementIds } = params;
-        
+
         try {
           // Lock elements through HTTP API updates
           const updatePromises = elementIds.map(async (id) => {
-            return await updateElementOnCanvas({ id, locked: true });
+            return await updateElementOnCanvas(room, { id, locked: true });
           });
           
           const results = await Promise.all(updatePromises);
@@ -1321,13 +1577,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
       
       case 'unlock_elements': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = ElementIdsSchema.parse(args);
         const { elementIds } = params;
-        
+
         try {
           // Unlock elements through HTTP API updates
           const updatePromises = elementIds.map(async (id) => {
-            return await updateElementOnCanvas({ id, locked: false });
+            return await updateElementOnCanvas(room, { id, locked: false });
           });
           
           const results = await Promise.all(updatePromises);
@@ -1347,6 +1604,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
       
       case 'create_from_mermaid': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = z.object({
           mermaidDiagram: z.string(),
           config: z.object({
@@ -1370,7 +1628,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         try {
           // Send the Mermaid diagram to the frontend via the API
           // The frontend will use mermaid-to-excalidraw to convert it
-          const response = await fetch(`${API_BASE}/elements/from-mermaid`, {
+          const response = await fetch(`${room.apiBase}/elements/from-mermaid`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1392,7 +1650,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           return {
             content: [{
               type: 'text',
-              text: `Mermaid diagram sent for conversion!\n\n${JSON.stringify(result, null, 2)}\n\nNote: The actual conversion happens in the frontend canvas with DOM access. Open ${ROOM_URL} to see the diagram rendered.`
+              text: `Mermaid diagram sent for conversion!\n\n${JSON.stringify(result, null, 2)}\n\nNote: The actual conversion happens in the frontend canvas with DOM access. Open ${room.roomViewUrl} to see the diagram rendered.`
             }]
           };
         } catch (error) {
@@ -1401,6 +1659,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
       
       case 'batch_create_elements': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = z.object({ elements: z.array(ElementSchema) }).parse(args);
         logger.info('Batch creating elements via MCP', { count: params.elements.length });
 
@@ -1435,7 +1694,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           createdElements.push(excalidrawElement);
         }
 
-        const canvasElements = await batchCreateElementsOnCanvas(createdElements);
+        const canvasElements = await batchCreateElementsOnCanvas(room, createdElements);
 
         if (!canvasElements) {
           throw new Error('Failed to batch create elements: HTTP server unavailable');
@@ -1462,10 +1721,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'get_element': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = ElementIdSchema.parse(args);
         const { id } = params;
 
-        const element = await getElementFromCanvas(id);
+        const element = await getElementFromCanvas(room, id);
         if (!element) {
           throw new Error(`Element ${id} not found`);
         }
@@ -1476,9 +1736,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'clear_canvas': {
+        const room = resolveRoom(extractRoomArgs(args));
         logger.info('Clearing canvas via MCP');
 
-        const response = await fetch(`${API_BASE}/elements/clear`, {
+        const response = await fetch(`${room.apiBase}/elements/clear`, {
           method: 'DELETE'
         });
 
@@ -1497,13 +1758,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'export_scene': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = z.object({
           filePath: z.string().optional()
         }).parse(args || {});
 
         logger.info('Exporting scene via MCP');
 
-        const response = await fetch(`${API_BASE}/elements`);
+        const response = await fetch(`${room.apiBase}/elements`);
         if (!response.ok) {
           throw new Error(`Failed to fetch elements: ${response.status} ${response.statusText}`);
         }
@@ -1514,7 +1776,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         // Fetch files for image elements
         let sceneFiles: Record<string, any> = {};
         try {
-          const filesResponse = await fetch(`${API_BASE}/files`);
+          const filesResponse = await fetch(`${room.apiBase}/files`);
           if (filesResponse.ok) {
             const filesData = await filesResponse.json() as any;
             sceneFiles = filesData.files || {};
@@ -1555,6 +1817,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'import_scene': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = z.object({
           filePath: z.string().optional(),
           data: z.string().optional(),
@@ -1593,14 +1856,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         let elementsToSync: ServerElement[] = elementsToImport;
         if (params.mode === 'merge') {
-          const existingResponse = await fetch(`${API_BASE}/elements`);
+          const existingResponse = await fetch(`${room.apiBase}/elements`);
           if (existingResponse.ok) {
             const existingData = await existingResponse.json() as ApiResponse;
             elementsToSync = [...(existingData.elements || []), ...elementsToImport];
           }
         }
 
-        const syncResponse = await fetch(`${API_BASE}/elements/sync`, {
+        const syncResponse = await fetch(`${room.apiBase}/elements/sync`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1621,7 +1884,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           const fileList = Object.values(importFiles);
           if (fileList.length > 0) {
             try {
-              await fetch(`${API_BASE}/files`, {
+              await fetch(`${room.apiBase}/files`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(fileList)
@@ -1640,20 +1903,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'export_to_image': {
+        const room = resolveRoom(extractRoomArgs(args));
+        const bboxSchema = z.object({
+          x: z.number(), y: z.number(),
+          w: z.number().positive(), h: z.number().positive()
+        });
         const params = z.object({
           format: z.enum(['png', 'svg']),
           filePath: z.string().optional(),
-          background: z.boolean().optional()
+          background: z.boolean().optional(),
+          scale: z.number().positive().max(4).optional(),
+          maxDim: z.number().min(100).max(8000).optional(),
+          bbox: bboxSchema.optional(),
+          timeoutMs: z.number().min(2000).max(120000).optional()
         }).parse(args);
 
         logger.info('Exporting to image via MCP', { format: params.format });
 
-        const response = await fetch(`${API_BASE}/export/image`, {
+        const response = await fetch(`${room.apiBase}/export/image`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             format: params.format,
-            background: params.background ?? true
+            background: params.background ?? true,
+            ...(params.scale !== undefined ? { scale: params.scale } : {}),
+            ...(params.maxDim !== undefined ? { maxDim: params.maxDim } : {}),
+            ...(params.bbox !== undefined ? { bbox: params.bbox } : {}),
+            ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {})
           })
         });
 
@@ -1690,6 +1966,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'duplicate_elements': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = z.object({
           elementIds: z.array(z.string()),
           offsetX: z.number().optional(),
@@ -1703,7 +1980,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         const duplicates: ServerElement[] = [];
         for (const id of params.elementIds) {
-          const original = await getElementFromCanvas(id);
+          const original = await getElementFromCanvas(room, id);
           if (!original) {
             logger.warn(`Element ${id} not found, skipping duplicate`);
             continue;
@@ -1726,7 +2003,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           throw new Error('No elements could be duplicated (none found)');
         }
 
-        const canvasElements = await batchCreateElementsOnCanvas(duplicates);
+        const canvasElements = await batchCreateElementsOnCanvas(room, duplicates);
 
         return {
           content: [{
@@ -1737,10 +2014,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'snapshot_scene': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = z.object({ name: z.string() }).parse(args);
         logger.info('Saving snapshot via MCP', { name: params.name });
 
-        const response = await fetch(`${API_BASE}/snapshots`, {
+        const response = await fetch(`${room.apiBase}/snapshots`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name: params.name })
@@ -1761,11 +2039,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'restore_snapshot': {
+        const room = resolveRoom(extractRoomArgs(args));
         const params = z.object({ name: z.string() }).parse(args);
         logger.info('Restoring snapshot via MCP', { name: params.name });
 
         // Fetch the snapshot
-        const response = await fetch(`${API_BASE}/snapshots/${encodeURIComponent(params.name)}`);
+        const response = await fetch(`${room.apiBase}/snapshots/${encodeURIComponent(params.name)}`);
         if (!response.ok) {
           throw new Error(`Snapshot "${params.name}" not found`);
         }
@@ -1773,10 +2052,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const data = await response.json() as { success: boolean; snapshot: { name: string; elements: ServerElement[]; createdAt: string } };
 
         // Clear current canvas
-        await fetch(`${API_BASE}/elements/clear`, { method: 'DELETE' });
+        await fetch(`${room.apiBase}/elements/clear`, { method: 'DELETE' });
 
         // Restore elements
-        const canvasElements = await batchCreateElementsOnCanvas(data.snapshot.elements);
+        const canvasElements = await batchCreateElementsOnCanvas(room, data.snapshot.elements);
 
         return {
           content: [{
@@ -1787,9 +2066,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'describe_scene': {
-        logger.info('Describing scene via MCP');
+        const room = resolveRoom(extractRoomArgs(args));
+        const params = DescribeSceneSchema.parse(args || {});
+        logger.info('Describing scene via MCP', params);
 
-        const response = await fetch(`${API_BASE}/elements`);
+        const response = await fetch(`${room.apiBase}/elements`);
         if (!response.ok) {
           throw new Error(`Failed to fetch elements: ${response.status}`);
         }
@@ -1797,119 +2078,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const data = await response.json() as ApiResponse;
         const allElements = data.elements || [];
 
-        if (allElements.length === 0) {
-          return {
-            content: [{ type: 'text', text: 'The canvas is empty. No elements to describe.' }]
-          };
-        }
-
-        // Count by type
-        const typeCounts: Record<string, number> = {};
-        for (const el of allElements) {
-          typeCounts[el.type] = (typeCounts[el.type] || 0) + 1;
-        }
-
-        // Bounding box
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (const el of allElements) {
-          minX = Math.min(minX, el.x);
-          minY = Math.min(minY, el.y);
-          maxX = Math.max(maxX, el.x + (el.width || 0));
-          maxY = Math.max(maxY, el.y + (el.height || 0));
-        }
-
-        // Build element descriptions sorted top-to-bottom, left-to-right
-        const sorted = [...allElements].sort((a, b) => {
-          const rowDiff = Math.floor(a.y / 50) - Math.floor(b.y / 50);
-          return rowDiff !== 0 ? rowDiff : a.x - b.x;
-        });
-
-        const elementDescs: string[] = [];
-        for (const el of sorted) {
-          const parts: string[] = [];
-          parts.push(`[${el.id}] ${el.type}`);
-          parts.push(`at (${Math.round(el.x)}, ${Math.round(el.y)})`);
-          if (el.width || el.height) {
-            parts.push(`size ${Math.round(el.width || 0)}x${Math.round(el.height || 0)}`);
-          }
-          if (el.text) parts.push(`text: "${el.text}"`);
-          if (el.label?.text) parts.push(`label: "${el.label.text}"`);
-          if (el.backgroundColor && el.backgroundColor !== 'transparent') {
-            parts.push(`bg: ${el.backgroundColor}`);
-          }
-          if (el.strokeColor && el.strokeColor !== '#000000') {
-            parts.push(`stroke: ${el.strokeColor}`);
-          }
-          if (el.locked) parts.push('(locked)');
-          if (el.groupIds && el.groupIds.length > 0) {
-            parts.push(`groups: [${el.groupIds.join(', ')}]`);
-          }
-          elementDescs.push(`  ${parts.join(' | ')}`);
-        }
-
-        // Find connections (arrows)
-        const arrows = allElements.filter(el => el.type === 'arrow');
-        const connectionDescs: string[] = [];
-        for (const arrow of arrows) {
-          const arrowAny = arrow as any;
-          if (arrowAny.startBinding?.elementId || arrowAny.endBinding?.elementId) {
-            const from = arrowAny.startBinding?.elementId || '?';
-            const to = arrowAny.endBinding?.elementId || '?';
-            connectionDescs.push(`  ${from} --> ${to} (arrow: ${arrow.id})`);
-          }
-        }
-
-        // Build description
-        const lines: string[] = [];
-        lines.push(`## Canvas Description`);
-        lines.push(`Total elements: ${allElements.length}`);
-        lines.push(`Types: ${Object.entries(typeCounts).map(([t, c]) => `${t}(${c})`).join(', ')}`);
-        lines.push(`Bounding box: (${Math.round(minX)}, ${Math.round(minY)}) to (${Math.round(maxX)}, ${Math.round(maxY)}) = ${Math.round(maxX - minX)}x${Math.round(maxY - minY)}`);
-        lines.push('');
-        lines.push('### Elements (top-to-bottom, left-to-right):');
-        lines.push(...elementDescs);
-
-        if (connectionDescs.length > 0) {
-          lines.push('');
-          lines.push('### Connections:');
-          lines.push(...connectionDescs);
-        }
-
-        // Groups
-        const groupedElements = allElements.filter(el => el.groupIds && el.groupIds.length > 0);
-        if (groupedElements.length > 0) {
-          const groupMap: Record<string, string[]> = {};
-          for (const el of groupedElements) {
-            for (const gid of (el.groupIds || [])) {
-              if (!groupMap[gid]) groupMap[gid] = [];
-              groupMap[gid]!.push(el.id);
-            }
-          }
-          lines.push('');
-          lines.push('### Groups:');
-          for (const [gid, ids] of Object.entries(groupMap)) {
-            lines.push(`  Group ${gid}: [${ids.join(', ')}]`);
-          }
-        }
-
         return {
-          content: [{ type: 'text', text: lines.join('\n') }]
+          content: [{ type: 'text', text: buildSceneDescription(allElements, params) }]
         };
       }
 
       case 'get_canvas_screenshot': {
+        const room = resolveRoom(extractRoomArgs(args));
+        const bboxSchema = z.object({
+          x: z.number(), y: z.number(),
+          w: z.number().positive(), h: z.number().positive()
+        });
         const params = z.object({
-          background: z.boolean().optional()
+          background: z.boolean().optional(),
+          scale: z.number().positive().max(4).optional(),
+          // 0 means "no cap"; otherwise default to 1600 so a huge scene
+          // doesn't try to rasterize ~100MP at 1x.
+          maxDim: z.number().min(0).max(8000).optional(),
+          bbox: bboxSchema.optional(),
+          timeoutMs: z.number().min(2000).max(120000).optional()
         }).parse(args || {});
 
-        logger.info('Taking canvas screenshot via MCP');
+        const effectiveMaxDim = params.maxDim === undefined ? 1600 : params.maxDim;
 
-        const response = await fetch(`${API_BASE}/export/image`, {
+        logger.info('Taking canvas screenshot via MCP', {
+          maxDim: effectiveMaxDim || 'uncapped',
+          scale: params.scale,
+          bbox: params.bbox
+        });
+
+        const response = await fetch(`${room.apiBase}/export/image`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             format: 'png',
-            background: params.background ?? true
+            background: params.background ?? true,
+            ...(params.scale !== undefined ? { scale: params.scale } : {}),
+            ...(effectiveMaxDim ? { maxDim: effectiveMaxDim } : {}),
+            ...(params.bbox !== undefined ? { bbox: params.bbox } : {}),
+            ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {})
           })
         });
 
@@ -1942,10 +2149,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'export_to_excalidraw_url': {
+        const room = resolveRoom(extractRoomArgs(args));
         logger.info('Exporting to excalidraw.com URL');
 
         // 1. Fetch current scene elements
-        const urlExportResponse = await fetch(`${API_BASE}/elements`);
+        const urlExportResponse = await fetch(`${room.apiBase}/elements`);
         if (!urlExportResponse.ok) {
           throw new Error(`Failed to fetch elements: ${urlExportResponse.status}`);
         }
@@ -2232,6 +2440,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'set_viewport': {
+        const room = resolveRoom(extractRoomArgs(args));
         const viewportParams = z.object({
           scrollToContent: z.boolean().optional(),
           scrollToElementId: z.string().optional(),
@@ -2242,7 +2451,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         logger.info('Setting viewport via MCP', viewportParams);
 
-        const viewportResponse = await fetch(`${API_BASE}/viewport`, {
+        const viewportResponse = await fetch(`${room.apiBase}/viewport`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(viewportParams)
