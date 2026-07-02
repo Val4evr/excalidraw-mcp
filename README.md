@@ -1,5 +1,20 @@
 # excalidraw-mcp
 
+> **⚠️ DEPRECATED (2026-07).** This repo has been merged into
+> [`Val4evr/excalidraw-zephy`](https://github.com/Val4evr/excalidraw-zephy), which now hosts the
+> canvas server *and* the MCP server (rebuilt from ~28 tools down to **6**: `set_room`, `create`,
+> `update`, `delete`, `read`, `screenshot`, with declarative auto-bound arrows and headless
+> screenshots). Install from the monorepo instead:
+>
+> ```
+> npx -y --package=github:Val4evr/excalidraw-zephy excalidraw-mcp
+> ```
+>
+> The code below is the old 28-tool shim, left intact so existing installs keep working, but it will
+> not receive updates.
+
+---
+
 Slim MCP server that drives a self-hosted [excalidraw-zephy](https://github.com/Val4evr/excalidraw-zephy) canvas. Tools accept per-call room overrides, so one shim can serve any number of rooms — point it at a default at install time, or set/switch rooms mid-session.
 
 ## Install (Claude Code)
